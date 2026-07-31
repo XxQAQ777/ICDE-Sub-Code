@@ -1,0 +1,14 @@
+torch==2.0.1
+ema-pytorch==0.2.1
+pandas==1.5.0
+numpy==1.23.5
+scikit-learn==1.1.2
+scipy==1.13.1
+matplotlib==3.6.0
+omegaconf==2.3.0
+PyYAML==6.0.3
+click==8.1.8
+tqdm==4.64.1
+visdom==0.2.4
+mlflow==3.1.4
+optuna==4.7.0

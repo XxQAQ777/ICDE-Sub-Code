@@ -1,0 +1,4 @@
+Usage: main.py [OPTIONS]
+Try 'main.py --help' for help.
+
+Error: Invalid value for '--dataset': 'etth1' is not one of 'metrla144', 'pemsbay144'.

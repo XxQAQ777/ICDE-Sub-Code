@@ -1,0 +1,213 @@
+# ============================================================
+# TEDM — Template config for a custom dataset
+# ============================================================
+# Copy this file and rename it to match your CSV file stem:
+#   cp config/dataset.yaml config/my_data.yaml
+#
+# Then place your data at:
+#   data/my_data.csv
+#
+# Run training with:
+#   python main.py --dataset my_data
+# ============================================================
+
+dataloader:
+  target: training.dataset.TimeSeriesDataset
+  params:
+    # Path to your CSV file. The file stem must match this config's filename
+    # and the --dataset argument passed to main.py / sample.py.
+    path: ./data/metrla144.csv
+
+    # Train / test split fractions. The remainder becomes the validation set.
+    # Example: train=0.7, test=0.2 → 70% train, 10% val, 20% test.
+    train: 0.7
+    test: 0.2
+
+    # Context window length: number of input timesteps the model conditions on
+    # during training. Must equal model.denoiser.params.seq_len below.
+    window: 144
+
+    # Additional conditioning steps prepended before the window.
+    # Set to 0 for unconditional generation (recommended starting point).
+    # Increase (e.g. 2) to condition on more past context.
+    past_k: 0
+
+    # Set to 1 to disable t-discretization (recommended).
+    # Set to 0 to enable explicit time-step discretization.
+    padding: 1
+
+  # Mini-batch size for training.
+  batch_size: 16
+
+  # Shuffle training batches. Recommended: True.
+  shuffle: True
+
+
+model:
+  denoiser:
+    # Denoiser architecture. Choose one:
+    #   models.networks.UNet        — convolutional U-Net (good general default)
+    #   models.networks.AttnNet     — attention-based network (used for ETTh1)
+    #   models.networks.LinearNet   — lightweight linear baseline
+    #   models.networks.ConvLSTMNet — convolutional LSTM network
+    target: models.networks.UNet
+    params:
+      # Must equal dataloader.params.window above. Used by all denoisers.
+      seq_len: 144
+
+      # If True, sigma is passed directly as conditioning; if False, a learned
+      # sinusoidal embedding is used. Used by UNet and ConvLSTMNet; ignored by others.
+      sigma_from_t: False
+
+      # --- UNet params (ignored by ConvLSTMNet, AttnNet, LinearNet) ---
+      # Kaiser low-pass filter for alias-free up/down-sampling.
+      kaiser_size: 64
+      kaiser_beta: 14.77
+      # model_channels: 32    # base channel width
+      # num_blocks: 2         # residual blocks per resolution
+      # dropout: 0.10         # dropout probability
+      # rope_attn: True       # rotary positional embedding
+      # alias_free: True      # alias-free resampling
+
+      # --- AttnNet params (ignored by all other denoisers) ---
+      # num_heads: 1          # multi-head attention heads
+
+  preconditioning:
+    # Preconditioning wrapper that rescales inputs/outputs for stable training.
+    # Choose one:
+    #   models.precond.TEDM   — TEDM preconditioning (recommended)
+    #   models.precond.EDM    — original EDM preconditioning
+    #   models.precond.iDDPM  — iDDPM-style preconditioning
+    target: models.precond.TEDM
+
+  noise_schedule:
+    # Noise schedule controls how noise is added/removed along the diffusion
+    # trajectory. Must be consistent with preconditioning above.
+    # Choose one:
+    #   models.noise.TEDM   — data-driven schedule (recommended)
+    #   models.noise.EDM    — fixed EDM schedule
+    #   models.noise.iDDPM  — cosine schedule
+    target: models.noise.TEDM
+    params:
+      # Expected standard deviation of the (StandardScaler-normalised) data.
+      # Leave at 1.0 when using StandardScaler (the default).
+      sigma_data: 1.0
+
+      # When scale_from_data is True (recommended), var_min / var_max and
+      # scale_min / scale_max are computed automatically from your data during
+      # training, so the values below are only fallback initialisations.
+      # Set scale_from_data: False and fill these manually if you want a fixed
+      # schedule instead.
+      var_min: 0.001
+      var_max: 5.0
+      scale_min: 1.0
+      scale_max: 8.0
+
+      # Estimate noise/scale schedules empirically from data (TEDM's key
+      # feature). Strongly recommended: True.
+      scale_from_data: True
+
+      # How running statistics are accumulated for the data-driven schedule.
+      #   cumulative — running mean over all seen batches.
+      #   sliding    — exponential moving average over recent batches.
+      stats: cumulative
+
+      # Window size for the sliding EMA (only used when stats: sliding).
+      sliding_window: 60
+
+      # EMA decay for the sliding statistics (only used when stats: sliding).
+      ema_beta: 0.99
+
+
+trainer:
+  # Total number of training iterations.
+  max_epochs: 20
+
+  # Accumulate gradients over N steps before an optimizer update.
+  gradient_accumulate_every: 1
+
+  ema:
+    # EMA decay for the shadow model used at inference. 0.995 is standard.
+    decay: 0.995
+    # Update EMA weights every N optimizer steps.
+    update_interval: 10
+
+  optimizer:
+    target: 'torch.optim.Adam'
+    params:
+      lr: 0.001
+      betas: [0.9, 0.96]
+
+  scheduler:
+    target: training.scheduler.ReduceLROnPlateauWithWarmup
+    params:
+      # Multiplicative LR reduction factor when loss plateaus.
+      factor: 0.9
+      # Number of epochs with no improvement before reducing LR.
+      patience: 15
+      # Minimum allowed learning rate.
+      min_lr: 1.0e-6
+      # Relative improvement threshold to count as an improvement.
+      threshold: 1.0e-2
+      threshold_mode: rel
+      # Learning rate at the start of the warmup phase.
+      warmup_lr: 8.0e-4
+      # Number of warmup steps before the main LR schedule takes effect.
+      warmup: 100
+      verbose: False
+
+  # Evaluate MSE/MAE on the validation set during training.
+  validation_check: False
+  # Visualise validation predictions in Visdom during training.
+  validation_viz: False
+
+  logger:
+    # Choose a logging backend. Options:
+    #   training.logger.BaseLogger    — file log only, no UI (simplest)
+    #   training.logger.VisdomLogger  — live loss curves in browser (http://localhost:8097)
+    #                                   start server first: python -m visdom.server -p 8097
+    #   training.logger.MLFlowLogger  — MLflow experiment tracking (http://localhost:5000)
+    #                                   start server first: mlflow ui
+    target: training.logger.BaseLogger
+    params:
+      # Log and save a checkpoint every N training steps.
+      log_freq: 50
+      # Visdom server address and port (only used by VisdomLogger).
+      server: 'localhost'
+      port: 8097
+      verbose: False
+      # Set to True to enable logging. False disables all logging.
+      enable: True
+      args: None
+      # Print per-step loss to the console (in addition to tqdm progress bar).
+      print_to_console: False
+      # Environment/experiment name used by VisdomLogger and MLFlowLogger.
+      env_name: 'TEDM'
+
+
+sampler:
+  # Sampler used at inference time. Choose one:
+  #   training.sampler.TEDM  — TEDM ODE/SDE sampler (recommended)
+  #   training.sampler.EDM   — EDM sampler
+  #   training.sampler.DDIM  — DDIM sampler
+  target: training.sampler.TEDM
+  params:
+    # Forecast horizon: number of future timesteps to predict.
+    # Typically set equal to window / seq_len for same-length forecasting.
+    horizon: 144
+
+    # True  → single deterministic point forecast (faster, lower memory)
+    # False → probabilistic multi-track sampling (produces uncertainty bands)
+    deterministic: True
+
+    # Number of stochastic sample paths (only used when deterministic: False).
+    n_tracks: 300
+
+    # Batch size used during inference / evaluation.
+    batch_size: 16
+
+    # Use backward integration through the SDE/ODE. Recommended: True.
+    backward: True
+
+    # Clamp predictions to the observed data range. Recommended: True.
+    clamp: True

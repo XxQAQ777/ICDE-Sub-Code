@@ -1,0 +1,83 @@
+dataloader:
+  batch_size: 128
+  params:
+    padding: 1
+    past_k: 10
+    path: ./data/exchange.csv
+    test: 0.2
+    train: 0.7
+    window: 96
+  shuffle: true
+  target: training.dataset.TimeSeriesDataset
+model:
+  denoiser:
+    params:
+      dropout: 0.022326518695754055
+      kaiser_beta: 17.270461214257764
+      kaiser_size: 6
+      model_channels: 32
+      num_blocks: 3
+      seq_len: 96
+      sigma_from_t: false
+    target: models.networks.UNet
+  noise_schedule:
+    params:
+      ema_beta: 0.99
+      scale_from_data: true
+      scale_max: 4.575816020969884
+      scale_min: 0.873176102171621
+      sigma_data: 1.0
+      sliding_window: 60
+      stats: cumulative
+      var_max: 7.71910036002791
+      var_min: 6.9356389387539e-07
+    target: models.noise.TEDM
+  preconditioning:
+    target: models.precond.TEDM
+sampler:
+  params:
+    backward: true
+    batch_size: 128
+    clamp: true
+    deterministic: true
+    horizon: 96
+    n_tracks: 300
+  target: training.sampler.TEDM
+trainer:
+  ema:
+    decay: 0.9960861385809779
+    update_interval: 10
+  gradient_accumulate_every: 1
+  logger:
+    params:
+      args: None
+      enable: true
+      env_name: TEDM
+      log_freq: 10
+      port: 8097
+      print_to_console: false
+      server: localhost
+      verbose: false
+    target: training.logger.BaseLogger
+  max_epochs: 2460
+  optimizer:
+    params:
+      betas:
+      - 0.9645428888054112
+      - 0.9920406483733314
+      lr: 0.0004319375059896183
+      weight_decay: 0.008817401886978162
+    target: torch.optim.Adam
+  scheduler:
+    params:
+      factor: 0.6843189655150844
+      min_lr: 1.0e-06
+      patience: 7
+      threshold: 0.01
+      threshold_mode: rel
+      verbose: false
+      warmup: 179
+      warmup_lr: 0.00021840035737629956
+    target: training.scheduler.ReduceLROnPlateauWithWarmup
+  validation_check: false
+  validation_viz: false
