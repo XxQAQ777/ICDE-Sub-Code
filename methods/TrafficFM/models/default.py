@@ -516,7 +516,11 @@ class gwnet(nn.Module):
         B, C, N, T = input.size()
         # 提取最后时刻的时间索引
         tod_index = input[:, self.in_tod_idx, 0, T-1].long() 
-        dow_index = input[:, self.in_dow_idx, 0, T-1].long()
+        if input.size(1) > self.in_dow_idx:
+            dow_index = input[:, self.in_dow_idx, 0, T-1].long()
+        else:
+            # PEMS-BAY-2feat has speed + time-of-day, but no day-of-week channel.
+            dow_index = torch.zeros_like(tod_index, dtype=torch.long)
         
         E_tod = self.tod_emb_dict(tod_index) 
         E_dow = self.dow_emb_dict(dow_index) 

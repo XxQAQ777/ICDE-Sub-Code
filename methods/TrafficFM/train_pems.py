@@ -1,6 +1,7 @@
 # train.py
 
 import os
+import csv
 
 import time
 
@@ -31,10 +32,13 @@ import importlib
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--model', type=str, default='default', help='model name (e.g., default, ablation1, ablation2)')
+parser.add_argument('--train_objective', type=str, default='point', choices=['point', 'model'], help='point: external masked MAE; model: use model(input, y=...) internal objective')
 
 parser.add_argument('--devices', type=str, default='0', help='comma-separated GPU ids, e.g. "0,1"')
 
 parser.add_argument('--data', type=str, default='data/PEMS-BAY-144-3feat-row', help='data path')
+parser.add_argument('--unified_data', type=str, default=None,
+                    help='STD-MAE dataset directory; uses its fixed 144-to-144 index dynamically')
 
 parser.add_argument('--adjdata', type=str, default='data/sensor_graph/adj_mx_bay.pkl', help='adj data path')
 
@@ -51,6 +55,8 @@ parser.add_argument('--randomadj', action='store_true', help='whether random ini
 parser.add_argument('--seq_length', type=int, default=144, help='input sequence length')
 
 parser.add_argument('--nhid', type=int, default=16, help='')
+parser.add_argument('--blocks', type=int, default=8, help='WaveNet temporal blocks')
+parser.add_argument('--layers', type=int, default=3, help='dilated layers per temporal block')
 
 parser.add_argument('--in_dim', type=int, default=3, help='inputs dimension')
 
@@ -65,6 +71,12 @@ parser.add_argument('--dropout', type=float, default=0.5, help='dropout rate')
 parser.add_argument('--weight_decay', type=float, default=0.0005, help='weight decay rate')
 
 parser.add_argument('--epochs', type=int, default=10, help='')
+parser.add_argument('--patience', type=int, default=0,
+                    help='early-stop after this many non-improving validation epochs; 0 disables it')
+parser.add_argument('--max_train_batches', type=int, default=0,
+                    help='optional per-epoch cap for a fast diagnostic run; 0 uses every fixed-split batch')
+parser.add_argument('--max_validation_batches', type=int, default=0,
+                    help='optional validation cap for a fast diagnostic run; 0 uses every fixed-split batch')
 
 parser.add_argument('--print_every', type=int, default=5000, help='')
 
@@ -75,6 +87,8 @@ parser.add_argument('--save', type=str, default='./gara_0106/pems_adj', help='sa
 parser.add_argument('--expid', type=int, default=1, help='experiment id')
 
 parser.add_argument('--dist_port', type=str, default='12356', help='tcp port for DDP init, e.g., 12355')
+parser.add_argument('--skip_final_test', action='store_true',
+                    help='avoid the legacy full-tensor test pass; use the streaming probabilistic evaluator instead')
 
 args = parser.parse_args()
 
@@ -256,7 +270,8 @@ def run(rank, device_ids):
 
     sensor_ids, sensor_id_to_ind, adj_mx = util.load_adj(args.adjdata, args.adjtype)
 
-    dataloader = util.load_dataset(args.data, args.batch_size, args.batch_size, args.batch_size)
+    dataloader = (util.load_unified_dataset(args.unified_data, args.batch_size, args.batch_size, args.batch_size)
+                  if args.unified_data else util.load_dataset(args.data, args.batch_size, args.batch_size, args.batch_size))
 
     scaler = dataloader['scaler']
 
@@ -290,7 +305,8 @@ def run(rank, device_ids):
 
         args.learning_rate, args.weight_decay, device, supports, args.gcn_bool, args.addaptadj,
 
-        adjinit, model_module=model_module
+        adjinit, model_module=model_module, train_objective=args.train_objective,
+        blocks=args.blocks, layers=args.layers,
 
     )
 
@@ -351,6 +367,8 @@ def run(rank, device_ids):
     val_time = []
 
     train_time = []
+    best_valid_loss = float('inf')
+    non_improving_epochs = 0
 
 
 
@@ -458,6 +476,9 @@ def run(rank, device_ids):
 
                     )
 
+            if args.max_train_batches > 0 and it + 1 >= args.max_train_batches:
+                break
+
 
 
         t2 = time.time()
@@ -534,6 +555,9 @@ def run(rank, device_ids):
 
                 valid_mae.append(avg_mae)
 
+            if args.max_validation_batches > 0 and it + 1 >= args.max_validation_batches:
+                break
+
 
 
         s2 = time.time()
@@ -586,6 +610,23 @@ def run(rank, device_ids):
 
             save_model(engine_inst, save_path)
 
+            if mvalid_loss < best_valid_loss:
+                best_valid_loss = mvalid_loss
+                non_improving_epochs = 0
+                # Stable name for evaluation scripts; epoch-specific files are retained.
+                save_model(engine_inst, args.save + "_best.pth")
+            else:
+                non_improving_epochs += 1
+
+            if args.patience > 0 and non_improving_epochs >= args.patience:
+                print(
+                    f'Early stopping at epoch {epoch}: no validation improvement for '
+                    f'{args.patience} epochs.', flush=True
+                )
+                with open(log_file, 'a') as f:
+                    f.write(f'Early stopping at epoch {epoch}: no validation improvement for {args.patience} epochs.\\n')
+                break
+
 
 
         if is_distributed:
@@ -601,6 +642,10 @@ def run(rank, device_ids):
         print("Average Inference Time: {:.4f} secs".format(np.mean(val_time)))
 
 
+
+        if args.skip_final_test:
+            print('Skipping legacy full-tensor test; checkpoints are ready for streaming evaluation.', flush=True)
+            return
 
         # 测试：仅在 rank 0 上执行
 
@@ -636,6 +681,10 @@ def run(rank, device_ids):
 
             with torch.no_grad():
 
+                # Match trainer.train/eval: PEMS08 has 12 history steps while
+                # this temporal stack has a 13-step receptive field.
+                testx = nn.functional.pad(testx, (1, 0, 0, 0))
+
                 preds = model_for_infer(testx)
 
                 preds = preds.permute(0, 3, 2, 1)
@@ -647,6 +696,16 @@ def run(rank, device_ids):
         yhat = torch.cat(outputs, dim=0)
 
         yhat = yhat[:realy.size(0), ...]
+        # Save full raw-scale predictions for transition-window evaluation.
+        pred_raw_all = scaler.inverse_transform(yhat).detach().cpu().numpy().transpose(0, 2, 1).astype(np.float32)
+        true_raw_all = realy.detach().cpu().numpy().transpose(0, 2, 1).astype(np.float32)
+
+        pred_save_dir = args.save + "_predictions"
+        os.makedirs(pred_save_dir, exist_ok=True)
+        pred_save_path = os.path.join(pred_save_dir, f"exp{args.expid}_pred_true.npz")
+        np.savez_compressed(pred_save_path, pred=pred_raw_all, true=true_raw_all)
+        print(f"Saved full test predictions to {pred_save_path}")
+
 
 
 
@@ -670,6 +729,7 @@ def run(rank, device_ids):
         amape = []
 
         armse = []
+        selected_metrics = {}
 
         for h in range(args.seq_length):
 
@@ -679,19 +739,31 @@ def run(rank, device_ids):
 
             metrics = util.metric(pred, real)
 
+            # util.metric returns fractional MAPE (e.g. 0.0887).  The shared
+            # PEMS08 report convention is percentage, matching the other
+            # baseline runners, so convert only at reporting time.
+            mape_percent = metrics[1] * 100.0
+
             log = 'Evaluate best model on test data for horizon {:d}, Test MAE: {:.4f}, Test MAPE: {:.4f}, Test RMSE: {:.4f}'
 
-            print(log.format(h + 1, metrics[0], metrics[1], metrics[2]))
+            print(log.format(h + 1, metrics[0], mape_percent, metrics[2]))
 
             # 将每个horizon的测试结果写入日志文件
             with open(log_file, 'a') as f:
-                f.write(log.format(h + 1, metrics[0], metrics[1], metrics[2]) + "\n")
+                f.write(log.format(h + 1, metrics[0], mape_percent, metrics[2]) + "\n")
 
             amae.append(metrics[0])
 
-            amape.append(metrics[1])
+            amape.append(mape_percent)
 
             armse.append(metrics[2])
+
+            if (h + 1) in (3, 6, 12):
+                selected_metrics[str(h + 1)] = {
+                    'MAE': float(metrics[0]),
+                    'RMSE': float(metrics[2]),
+                    'MAPE': float(mape_percent),
+                }
 
 
 
@@ -707,6 +779,22 @@ def run(rank, device_ids):
             f.write(log + "\n")
             f.write("="*100 + "\n\n")
             f.write(f"Final best model saved at: {final_save_path}\n")
+
+        # Compact report for the native PEMS08 12->12 setup.  MAPE is the
+        # percentage returned by util.metric and must not be multiplied again.
+        selected_metrics['Average'] = {
+            'MAE': float(np.mean(amae)),
+            'RMSE': float(np.mean(armse)),
+            'MAPE': float(np.mean(amape)),
+        }
+        metrics_csv = args.save + '_metrics.csv'
+        with open(metrics_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['horizon', 'MAE', 'RMSE', 'MAPE'])
+            writer.writeheader()
+            for horizon in ('3', '6', '12', 'Average'):
+                if horizon in selected_metrics:
+                    writer.writerow({'horizon': horizon, **selected_metrics[horizon]})
+        print(f'Saved selected test metrics to {metrics_csv}', flush=True)
 
 
         save_model(engine_inst, final_save_path)

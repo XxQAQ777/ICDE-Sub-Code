@@ -14,7 +14,7 @@ import util
 
 class trainer():
 
-    def __init__(self, scaler, in_dim, seq_length, num_nodes, nhid , dropout, lrate, wdecay, device, supports, gcn_bool, addaptadj, aptinit, model_module=None):
+    def __init__(self, scaler, in_dim, seq_length, num_nodes, nhid , dropout, lrate, wdecay, device, supports, gcn_bool, addaptadj, aptinit, model_module=None, train_objective='point', blocks=8, layers=3):
 
         # 如果提供了 model_module, 使用它; 否则使用默认的 model_cfg
 
@@ -38,7 +38,8 @@ class trainer():
 
             residual_channels=nhid, dilation_channels=nhid,
 
-            skip_channels=nhid * 8, end_channels=nhid * 16
+            skip_channels=nhid * 8, end_channels=nhid * 16,
+            blocks=blocks, layers=layers,
 
         )
 
@@ -47,6 +48,8 @@ class trainer():
         self.optimizer = optim.Adam(self.model.parameters(), lr=lrate, weight_decay=wdecay)
 
         self.loss = util.masked_mae
+
+        self.train_objective = train_objective
 
         self.scaler = scaler
 
@@ -62,19 +65,21 @@ class trainer():
 
         input = nn.functional.pad(input, (1, 0, 0, 0))
 
-        output = self.model(input)
+        real = torch.unsqueeze(real_val, dim=1)  # [B, 1, N, T], raw scale
 
-        output = output.transpose(1, 3)
-
-        # output = [batch_size, out_dim(seq_length), num_nodes, 1]
-
-        real = torch.unsqueeze(real_val, dim=1)
-
-        predict = self.scaler.inverse_transform(output)
-
-
-
-        loss = self.loss(predict, real, 0.0)
+        if self.train_objective == 'model':
+            # model-internal loss expects normalized target with shape [B, T, N, 1]
+            y_norm = self.scaler.transform(real).transpose(1, 3).contiguous()
+            loss = self.model(input, y=y_norm)
+        elif self.train_objective == 'point':
+            # Point-loss ablation: keep the default TrafficFM architecture,
+            # but train against MAE using a short FM sampling path for feasibility.
+            output = self.model(input, fm_steps=2)
+            output = output.transpose(1, 3)
+            predict = self.scaler.inverse_transform(output)
+            loss = self.loss(predict, real, 0.0)
+        else:
+            raise ValueError(f"Unknown train_objective: {self.train_objective}")
 
         loss.backward()
 
@@ -84,13 +89,19 @@ class trainer():
 
         self.optimizer.step()
 
+        # Lightweight train metrics. For FM objective this samples with fewer ODE steps.
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            output = self.model(input, fm_steps=5)
+            output = output.transpose(1, 3)
+            predict = self.scaler.inverse_transform(output)
 
-
-        mape = util.masked_mape(predict, real, 0.0).item()
-
-        rmse = util.masked_rmse(predict, real, 0.0).item()
-
-        mae = util.masked_mae(predict, real, 0.0).item()
+            mape = util.masked_mape(predict, real, 0.0).item()
+            rmse = util.masked_rmse(predict, real, 0.0).item()
+            mae = util.masked_mae(predict, real, 0.0).item()
+        if was_training:
+            self.model.train()
 
         return loss.item(), mape, rmse, mae
 

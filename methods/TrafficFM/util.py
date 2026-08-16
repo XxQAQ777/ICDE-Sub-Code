@@ -47,6 +47,44 @@ class DataLoader(object):
 
         return _wrapper()
 
+
+class IndexedDataLoader(object):
+    """Memory-bounded loader over an explicit [history, future] index."""
+    def __init__(self, processed, indices, scaler, batch_size, shuffle=False):
+        self.processed = processed.astype(np.float32, copy=False)
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.scaler = scaler
+        self.batch_size = batch_size
+        self.shuffle_enabled = shuffle
+        self.order = np.arange(len(self.indices))
+        self.size = len(self.indices)
+        self.num_batch = int(np.ceil(self.size / self.batch_size))
+
+    def shuffle(self):
+        if self.shuffle_enabled:
+            self.order = np.random.permutation(len(self.indices))
+
+    def get_iterator(self):
+        order = self.order.copy()
+        def _wrapper():
+            for batch_no in range(self.num_batch):
+                chosen = order[batch_no * self.batch_size:(batch_no + 1) * self.batch_size]
+                if len(chosen) < self.batch_size:
+                    chosen = np.pad(chosen, (0, self.batch_size - len(chosen)), mode='edge')
+                x = np.empty((len(chosen), 144, self.processed.shape[1], 3), dtype=np.float32)
+                y = np.empty((len(chosen), 144, self.processed.shape[1], 1), dtype=np.float32)
+                for row, item in enumerate(chosen):
+                    start, middle, end = self.indices[item]
+                    history = self.processed[start:middle]
+                    future = self.processed[middle:end, :, 0]
+                    x[row] = history
+                    # TrafficFM expects its speed input normalized, while its
+                    # target stays on the original speed scale.
+                    x[row, ..., 0] = self.scaler.transform(history[..., 0])
+                    y[row, ..., 0] = future
+                yield x, y
+        return _wrapper()
+
 class StandardScaler():
     """
     Standard the input
@@ -157,6 +195,27 @@ def load_dataset(dataset_dir, batch_size, valid_batch_size= None, test_batch_siz
     data['scaler'] = scaler
     return data
 
+
+def load_unified_dataset(dataset_dir, batch_size, valid_batch_size=None, test_batch_size=None):
+    """Use the maintained STD-MAE data and fixed index without materializing windows."""
+    with open(os.path.join(dataset_dir, 'data_in144_out144.pkl'), 'rb') as handle:
+        processed = pickle.load(handle)['processed_data'].astype(np.float32)
+    with open(os.path.join(dataset_dir, 'index_in144_out144.pkl'), 'rb') as handle:
+        index = pickle.load(handle)
+    with open(os.path.join(dataset_dir, 'scaler_in144_out144.pkl'), 'rb') as handle:
+        scaler_data = pickle.load(handle)['args']
+    mean, std = float(scaler_data['mean']), float(scaler_data['std'])
+    processed = processed.copy()
+    processed[..., 0] = processed[..., 0] * std + mean
+    scaler = StandardScaler(mean=mean, std=std)
+    valid = index['valid'] if 'valid' in index else index['val']
+    return {
+        'train_loader': IndexedDataLoader(processed, index['train'], scaler, batch_size, shuffle=True),
+        'val_loader': IndexedDataLoader(processed, valid, scaler, valid_batch_size or batch_size),
+        'test_loader': IndexedDataLoader(processed, index['test'], scaler, test_batch_size or batch_size),
+        'scaler': scaler,
+    }
+
 def masked_mse(preds, labels, null_val=np.nan):
     if np.isnan(null_val):
         mask = ~torch.isnan(labels)
@@ -207,5 +266,4 @@ def metric(pred, real):
     mape = masked_mape(pred,real,0.0).item()
     rmse = masked_rmse(pred,real,0.0).item()
     return mae,mape,rmse
-
 
